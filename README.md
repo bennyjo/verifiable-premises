@@ -6,6 +6,7 @@ Check every premise a task relies on against a quoted primary source, and link e
 
 One wrong premise about an outside system can be copied into the code, the tests, and the reviewer's brief, so every gate agrees with it.
 A `premises.json` ledger records each premise with a verbatim quote from its primary source, and a script re-checks that the quote is still there and that every test link is valid.
+A second command changes the code that encodes each premise and checks that the premise's linked tests fail, so a test that only looks like it pins a premise is caught.
 
 ## Who it's for
 
@@ -18,7 +19,7 @@ Early and unreleased, at version 0.1.0.
 
 - There are no tagged releases, and the package isn't published to npm.
 - The ledger schema and the JSON report can still change between commits.
-- The checker has one command, `check`.
+- The checker has two commands: `check` and `mutate`.
 
 ## Contents
 
@@ -80,6 +81,7 @@ Change `60` to `100` in `demo/limits.md` and run the check again: it exits 1 and
 
 Coding agents are the main users of this tool.
 Every command below is non-interactive: the checker never prompts, needs no install, and uses the network only to fetch a ledger's `http://` and `https://` sources.
+`premises mutate` also runs the ledger's `testCommand`, so the tests it runs can do whatever your test suite does.
 
 ### From clone to a verified run
 
@@ -127,15 +129,19 @@ There's no `--version` option.
 | `premises` | `[{id, verdict, claim, source, quoteFound, paraphrasedIn, note, tests}]`, one entry per premise. `source` and `quoteFound` are `null` for a premise without a source. `paraphrasedIn` (`[{source, quoteFound}]`) and `note` appear only when the ledger sets them. |
 
 A check with an `http://` or `https://` source writes the response under `.premises/captures/` next to the ledger.
+`premises mutate` works in a temporary copy of the ledger's directory and deletes it when it's done.
 The checker writes nothing else.
 
 ## Usage
 
 ```sh
 node bin/premises.mjs check [path]
+node bin/premises.mjs mutate [path]
 ```
 
 `path` is a `premises.json` file or a directory that holds one, and defaults to `./premises.json`.
+
+### `premises check`
 
 | Exit code | Meaning |
 |---|---|
@@ -145,6 +151,89 @@ node bin/premises.mjs check [path]
 
 The checker prints a JSON report with counts per verdict, missing quotes, unpinned premises, unknown tests, pinned premises that aren't supported, snapshot fallbacks, and stored HTTP captures.
 See [`SKILL.md`](SKILL.md) for each field, the source forms, and the test link rule.
+
+### `premises mutate`
+
+A test can link to a premise and pass without pinning it: it might check the length of a retry schedule but not its delays.
+`premises mutate` finds such tests.
+Each premise lists, in `mutants`, the code that encodes it, and the ledger sets the command that runs the tests:
+
+```json
+{
+  "testFiles": ["test/*.test.mjs"],
+  "testCommand": ["node", "--test", "--test-name-pattern", "{pattern}", "test/*.test.mjs"],
+  "premises": [
+    {
+      "id": "disable-threshold",
+      "tests": ["disable-threshold: disables after 20 failures over 6 hours"],
+      "mutants": [
+        { "file": "src/retry.mjs", "find": "consecutiveFailures >= 20 && failingForMs >= 6 * HOUR" }
+      ]
+    }
+  ]
+}
+```
+
+The other premise fields are left out of this example.
+For each supported premise that has both `tests` and `mutants`, the command does the following:
+
+1. Copies the ledger's directory, without `.git` and `.premises`, to a temporary directory. Your files are never changed.
+1. Runs `testCommand` in the copy, with each `{pattern}` replaced by a regular expression that matches the premise's test IDs. This is the baseline, and it must pass.
+1. Makes one mutant for each value in each `find` text, and runs the same command again for each mutant.
+   A mutant is killed when the command exits non-zero, and survives when it exits 0.
+
+| Value in `find` | Mutants |
+|---|---|
+| A decimal number, such as `3`, `60_000`, or `0.5` | One more, and one less unless the number is 0 |
+| `<`, `<=`, `>`, or `>=` | `<` and `<=` swap, and so do `>` and `>=` |
+| `==`, `!=`, `===`, or `!==` | Negated |
+| `true`, `false`, `True`, or `False` | Flipped |
+| A quoted string, such as `'payment'` | `-mutant` added inside the quotes |
+
+`file` is relative to the ledger and must stay inside its directory.
+`find` is exact text that must occur once in that file, so a target that a refactor moved shows up as invalid instead of passing.
+Only `supported` premises can have `mutants`.
+
+`testCommand` runs without a shell.
+Without `{pattern}`, every mutant runs the whole command and the report says `"selection": "suite"`.
+Then a mutant that an unrelated test catches counts as killed, which says nothing about the premise's own tests.
+A mutant that runs longer than 10 seconds, or three times the baseline if that's longer, is stopped and counted as killed, because it changed the behavior.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every mutant was killed. |
+| `1` | A mutant survived, or a `mutants` target is invalid. |
+| `2` | Usage or input error, including a ledger without `testCommand`, a `mutants` target reached through a symbolic link, or linked tests that fail before any mutation. |
+
+While it runs, the command writes one line per mutant to stderr:
+
+```text
+disable-threshold  src/retry.mjs:11  >= -> >  survived  93ms
+```
+
+With exit code 0 or 1, stdout holds one JSON object.
+When linked tests fail before any mutation, stdout holds the same object with an `error` field and the exit code is 2.
+Other errors print `{"ok": false, "error": "<message>"}`, as `premises check` does.
+
+| Report field | Contents |
+|---|---|
+| `ok` | `true` when the exit code is 0. |
+| `error` | Present only with exit code 2: which premises' linked tests fail before any mutation. |
+| `ledger` | The ledger path, as given or with `premises.json` appended to a directory. |
+| `selection` | `pattern` when `testCommand` has `{pattern}`, otherwise `suite`. |
+| `counts` | `{"killed": n, "survived": n, "timedOut": n}`. Timed-out mutants count as caught. |
+| `survived` | `[{id, file, line, kind, from, to, mutated}]`, where `mutated` is the `find` text with the change. Strengthen the linked tests until each one is killed. |
+| `invalidMutants` | `[{id, file, find, reason}]` for a target whose file is missing, whose `find` text is not found or found more than once, or that has no value to mutate. |
+| `noMutants` | IDs of supported premises that tests pin but that have no `mutants`. They don't fail the run. |
+| `unpinned` | IDs of supported premises with `mutants` but no `tests` yet. They are skipped and don't fail the run. |
+| `premises` | `[{id, tests, baseline, mutants}]` for each premise that ran. `baseline` is `{exitCode, ms, testsNotSeen}`, plus the end of the output in `output` when it failed. `mutants` is `[{file, line, kind, from, to, result, ms}]`, and `result` is `killed`, `survived`, or `timedOut`. |
+
+`testsNotSeen` lists linked test IDs that the baseline output never names.
+Node.js exits 0 when `--test-name-pattern` matches no test, so every mutant of such a premise survives; this list tells you why.
+It's a warning, not a failure, because some test runners don't print test names.
+
+An equivalent mutant is one that no correct test can catch, such as a number in a comment.
+To leave it out, shorten `find` so it doesn't include that value, and say why in the premise's `note`.
 
 ## Example: webhook retries
 

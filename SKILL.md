@@ -1,12 +1,13 @@
 ---
 name: verifiable-premises
-description: Tie each premise a task relies on to a quoted primary source that a script re-checks, and link each test to the premise it pins. Use before writing tests or code that depend on facts about an outside system, an API, a spec, or a design decision, and whenever a brief or contract restates such facts.
+description: Tie each premise a task relies on to a quoted primary source that a script re-checks, link each test to the premise it pins, and check that those tests fail when the code that encodes the premise changes. Use before writing tests or code that depend on facts about an outside system, an API, a spec, or a design decision, and whenever a brief or contract restates such facts.
 ---
 
 # Verifiable premises
 
 One wrong premise about an outside system gets copied into the code, the tests, the hidden checks, and the reviewer's brief, so every gate agrees with it.
 This skill breaks that chain: write each premise down with a verbatim quote from its primary source, let a script confirm the quote is really there, and make every test name the premise it pins.
+Then a second command breaks the code that encodes each premise and confirms the premise's tests notice.
 
 ## When to use it
 
@@ -40,7 +41,10 @@ Write `premises.json` before you write tests or code.
 6. **Write tests that pin supported premises.**
    Put the premise's test ID string, such as `rate-limit-per-key: rejects the 61st request`, in the test's name, and list the same string in the premise's `tests`.
    Never pin a premise that is contradicted or unsupported.
-7. **Run the checker again** before you hand off, and add its JSON report to the PR or the reviewer's brief.
+   In the premise's `mutants`, list the code that encodes it: the file, and the exact text that holds its values.
+7. **Run the checker again, then `premises mutate`,** before you hand off.
+   Fix each surviving mutant by strengthening the test, not by shortening `find`.
+   Add both JSON reports to the PR or the reviewer's brief.
 
 ### Example premise
 
@@ -105,3 +109,51 @@ Read these report fields:
 
 A test ID resolves when its exact string appears anywhere in a file that a `testFiles` glob matches, with globs relative to the ledger.
 Pick IDs that won't appear by accident, such as the premise ID plus a short description.
+
+## Checking that tests bite
+
+A linked test can pass without pinning its premise.
+For example, a test that checks a retry schedule has three entries passes whatever the delays are.
+`premises mutate` catches this: it changes each value in the code a premise points at, one at a time, and runs only that premise's linked tests.
+Every change must make them fail.
+
+Set `testCommand` once in the ledger, as an argv array.
+`{pattern}` becomes a regular expression that matches the premise's test IDs:
+
+```json
+"testCommand": ["node", "--test", "--test-name-pattern", "{pattern}", "test/*.test.mjs"]
+```
+
+Then point each pinned premise at the code that encodes it:
+
+```json
+"mutants": [
+  { "file": "src/retry.mjs", "find": "consecutiveFailures >= 20 && failingForMs >= 6 * HOUR" }
+]
+```
+
+`file` is relative to the ledger and inside its directory.
+`find` is exact text that occurs once in that file.
+The command changes every number, comparison, equality test, boolean, and string literal in `find`, and runs the tests in a temporary copy of the ledger's directory, so your files never change.
+
+```sh
+node bin/premises.mjs mutate path/to/premises.json
+```
+
+| Exit code | Meaning |
+|---|---|
+| `0` | The linked tests failed for every mutant. |
+| `1` | A mutant survived, or a `mutants` target is not found, not unique, or has no value to mutate. |
+| `2` | Usage or input error, including a ledger without `testCommand`, or linked tests that already fail before any mutation. |
+
+Read these report fields:
+
+- `survived`: each mutant the linked tests missed, with its line and the changed `find` text. Add a test case that fails for that change, such as a boundary value or an exact expected list.
+- `invalidMutants`: targets that no longer match the code. Update `find` after a refactor.
+- `noMutants`: pinned premises with no `mutants` yet. They don't fail the run, but each one is a gap to close before review.
+- `premises[].baseline.testsNotSeen`: linked test IDs that the test run never named. If every mutant of a premise survives, check this first: the pattern may select no test.
+
+If a value in `find` can't change behavior, such as a number in a comment, shorten `find` to leave it out and say why in the premise's `note`.
+
+In CI, run `premises mutate` after the test step.
+It takes about one test run per mutant.
