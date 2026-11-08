@@ -1,0 +1,123 @@
+{
+  "$schema": "../../schema/premises.schema.json",
+  "task": "Webhook delivery, phase 1: retry rules for failed deliveries (a made-up task)",
+  "testFiles": ["tests/**/*.test.ts"],
+  "premises": [
+    {
+      "id": "retry-cap",
+      "claim": "A delivery gets at most three retries, on the schedules the design report lists. Only the delays and the threshold are starting points to tune in production; the cap is not.",
+      "source": "sources/design-report.md",
+      "quote": "**One retry schedule per endpoint, and at most three retries per delivery.** A fourth retry recovered no deliveries in the pilot.",
+      "retrieved": "2026-11-04",
+      "verdict": "supported",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "Each delivery retries on its family's schedule, whose delays and disable threshold are starting points to tune in production."
+        }
+      ],
+      "note": "The design report is the source of this rule. The contract only paraphrases it, and the paraphrase drops the cap of three, so its retry rules read as the schedule. Tests must pin the design report's schedules, not the contract's rules.",
+      "tests": []
+    },
+    {
+      "id": "payment-schedule",
+      "claim": "Payment events retry after 1 minute, 10 minutes, and 1 hour.",
+      "source": "sources/design-report.md",
+      "quote": "| **Payment** (`payment`) | 1 minute, 10 minutes, and 1 hour |",
+      "retrieved": "2026-11-04",
+      "verdict": "supported",
+      "tests": []
+    },
+    {
+      "id": "payment-ten-second-retry",
+      "claim": "Payment events retry first after 10 seconds.",
+      "source": "sources/design-report.md",
+      "quote": "A 10-second retry is too soon to help (4 of 130 failures recovered). It joins the 1-minute retry.",
+      "retrieved": "2026-11-04",
+      "verdict": "contradicted",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "Payment: retry after 10 seconds, then 1 minute, then 10 minutes, then 1 hour."
+        }
+      ],
+      "note": "The 10-second retry merges into the 1-minute one. The contract's four Payment retries also break the design report's cap of three per delivery.",
+      "tests": []
+    },
+    {
+      "id": "order-timeout-class",
+      "claim": "Order events keep timeouts as their own retry class.",
+      "source": "sources/design-report.md",
+      "quote": "Timeouts fold into server errors (5 endpoints).",
+      "retrieved": "2026-11-04",
+      "verdict": "contradicted",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "Order: retry timeouts as their own class after 1 minute"
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "account-retry-gone",
+      "claim": "Account events retry a 410 Gone response.",
+      "source": "sources/design-report.md",
+      "quote": "Don't retry a `410 Gone` response: the receiver has removed the endpoint",
+      "retrieved": "2026-11-04",
+      "verdict": "contradicted",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "Account: retry every failure after 1 hour, including 410 Gone (`410`)."
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "one-schedule-per-endpoint",
+      "claim": "An endpoint uses at most one retry schedule, so every delivery to it follows the same delays.",
+      "source": "sources/design-report.md",
+      "quote": "Each endpoint belongs to one event family and has at most one retry schedule, so every delivery to it follows the same delays.",
+      "retrieved": "2026-11-04",
+      "verdict": "supported",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "each endpoint may use at most one retry schedule, chosen from its event family and adjustable per endpoint."
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "disable-threshold",
+      "claim": "An endpoint is disabled only after at least 20 consecutive failures over at least 6 hours.",
+      "source": "sources/design-report.md",
+      "quote": "An endpoint is disabled only after at least 20 consecutive failures over at least 6 hours.",
+      "retrieved": "2026-11-04",
+      "verdict": "supported",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "The starting threshold is 20 consecutive failures over 6 hours; it is a tunable starting point."
+        }
+      ],
+      "tests": []
+    },
+    {
+      "id": "quota-per-event",
+      "claim": "Retries never count toward a customer's quota; quota stays per original event.",
+      "source": "sources/design-report.md",
+      "quote": "Quota stays per original event only. Retries never count toward it.",
+      "retrieved": "2026-11-04",
+      "verdict": "supported",
+      "paraphrasedIn": [
+        {
+          "source": "sources/contract.md",
+          "quote": "Retries never count toward a customer's delivery quota; quota stays per original event."
+        }
+      ],
+      "tests": []
+    }
+  ]
+}

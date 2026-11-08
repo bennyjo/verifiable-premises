@@ -1,0 +1,465 @@
+// Tests for bin/premises.mjs. They never touch the network: HTTP sources are served
+// by a local server on 127.0.0.1.
+import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { after, before, describe, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import { htmlToText, main, normalize, sha256, validate } from '../bin/premises.mjs';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const CLI = join(ROOT, 'bin', 'premises.mjs');
+const EXAMPLE = join(ROOT, 'examples', 'webhook-retries');
+
+function tempDir() {
+  return mkdtempSync(join(tmpdir(), 'premises-test-'));
+}
+
+// Write a ledger and its files into a fresh directory and return the directory.
+function fixture(ledger, files = {}) {
+  const dir = tempDir();
+  for (const [name, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(dir, name)), { recursive: true });
+    writeFileSync(join(dir, name), text);
+  }
+  writeFileSync(join(dir, 'premises.json'), JSON.stringify(ledger, null, 2));
+  return dir;
+}
+
+function premise(fields) {
+  return { id: 'p1', claim: 'A claim.', retrieved: '2026-10-25', verdict: 'supported', tests: [], ...fields };
+}
+
+function cli(...args) {
+  const r = spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
+  return { code: r.status, report: r.stdout.trim().startsWith('{') ? JSON.parse(r.stdout) : null, stdout: r.stdout, stderr: r.stderr };
+}
+
+// Run the checker in-process, so tests can serve HTTP from the same process.
+async function run(dir) {
+  let out = '';
+  const io = { out: { write: (s) => (out += s) }, err: { write: () => {} } };
+  const code = await main(['check', dir], io);
+  return { code, report: JSON.parse(out) };
+}
+
+describe('normalize and htmlToText', () => {
+  test('collapses whitespace runs and trims', () => {
+    assert.equal(normalize('  a\n\tb   c \n'), 'a b c');
+  });
+
+  test('drops tags, scripts, and decodes entities', () => {
+    const html = '<p>Rate&nbsp;limit is <b>100</b> &amp; resets</p><script>var x = "<p>no</p>";</script>&#39;ok&#x27;';
+    assert.equal(normalize(htmlToText(html)), "Rate limit is 100 & resets 'ok'");
+  });
+
+  test('joins inline tags to adjacent punctuation and separates block tags', () => {
+    const html = '<h2>Limits</h2><p>Set <code>limit</code>.</p><p>Read <a href="/d">docs</a>, then<br>retry.</p><ul><li>one</li><li>two</li></ul>';
+    assert.equal(normalize(htmlToText(html)), 'Limits Set limit. Read docs, then retry. one two');
+  });
+
+  test('joins text on each side of comments and hidden elements', () => {
+    const html = '<p>Set <!-- -->limit<!-- -->. Use v<script>x()</script>2<style>p{}</style>.</p>';
+    assert.equal(normalize(htmlToText(html)), 'Set limit. Use v2.');
+  });
+
+  test('decodes common named typographic entities, so a browser-copied quote matches', () => {
+    const html = '<p>Don&rsquo;t retry &mdash; ever&hellip; &lsquo;a&rsquo; &ldquo;b&rdquo; 1&ndash;3</p>';
+    assert.equal(normalize(htmlToText(html)), 'Don\u2019t retry \u2014 ever\u2026 \u2018a\u2019 \u201Cb\u201D 1\u20133');
+  });
+
+  test('leaves a numeric entity that names no code point as text', () => {
+    assert.equal(htmlToText('a &#xFFFFFFFF; b &#9999999999; c &#x41;'), 'a &#xFFFFFFFF; b &#9999999999; c A');
+  });
+});
+
+describe('webhook retries example', () => {
+  test('passes and shows the design report as the source the contract paraphrases', () => {
+    const { code, report } = cli('check', EXAMPLE);
+    assert.equal(code, 0);
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.counts, { supported: 5, contradicted: 3, unsupported: 0 });
+    assert.deepEqual(report.missingQuotes, []);
+    assert.deepEqual(report.testFiles, [], 'the ledger is written before any test exists');
+    const cap = report.premises.find((p) => p.id === 'retry-cap');
+    assert.equal(cap.source, 'sources/design-report.md');
+    assert.equal(cap.quoteFound, true);
+    assert.deepEqual(cap.paraphrasedIn, [{ source: 'sources/contract.md', quoteFound: true }]);
+    assert.ok(report.unpinned.includes('retry-cap'));
+    const contradicted = report.premises.filter((p) => p.verdict === 'contradicted').map((p) => p.id);
+    assert.deepEqual(contradicted, ['payment-ten-second-retry', 'order-timeout-class', 'account-retry-gone']);
+  });
+
+  test('adversarial: replacing one word in one quote exits 1', () => {
+    const dir = tempDir();
+    cpSync(EXAMPLE, dir, { recursive: true });
+    const path = join(dir, 'premises.json');
+    const ledger = JSON.parse(readFileSync(path, 'utf8'));
+    const cap = ledger.premises.find((p) => p.id === 'retry-cap');
+    cap.quote = cap.quote.replace('at most three retries', 'at most four retries');
+    writeFileSync(path, JSON.stringify(ledger, null, 2));
+    const { code, report } = cli('check', dir);
+    assert.equal(code, 1);
+    assert.equal(report.ok, false);
+    assert.deepEqual(report.missingQuotes.map((m) => [m.id, m.where]), [['retry-cap', 'quote']]);
+  });
+
+  test('adversarial: an edited paraphrase quote also exits 1', () => {
+    const dir = tempDir();
+    cpSync(EXAMPLE, dir, { recursive: true });
+    const path = join(dir, 'premises.json');
+    const ledger = JSON.parse(readFileSync(path, 'utf8'));
+    const p = ledger.premises.find((x) => x.id === 'account-retry-gone');
+    p.paraphrasedIn[0].quote = p.paraphrasedIn[0].quote.replace('410 Gone', '404 Not Found');
+    writeFileSync(path, JSON.stringify(ledger, null, 2));
+    const { code, report } = cli('check', dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.missingQuotes.map((m) => [m.id, m.where]), [['account-retry-gone', 'paraphrasedIn[0]']]);
+  });
+});
+
+describe('local file sources', () => {
+  const doc = 'The API allows 100 requests\nper minute per token.\n';
+
+  test('a quote with non-ASCII characters matches', async () => {
+    const text = 'Caf\u00E9 retries \u2014 na\u00EFve backoff \u2026 done.\n';
+    const dir = fixture({ premises: [premise({ source: 'doc.md', quote: 'Caf\u00E9 retries \u2014 na\u00EFve backoff' })] }, { 'doc.md': text });
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.equal(report.premises[0].quoteFound, true);
+  });
+
+  test('a quote that wraps across lines matches', async () => {
+    const dir = fixture({ premises: [premise({ source: 'doc.md', quote: 'allows 100 requests per   minute' })] }, { 'doc.md': doc });
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.equal(report.premises[0].quoteFound, true);
+  });
+
+  test('an invented quote exits 1', async () => {
+    const dir = fixture({ premises: [premise({ source: 'doc.md', quote: 'allows 1000 requests per minute' })] }, { 'doc.md': doc });
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.equal(report.missingQuotes[0].reason, 'quote not found in source');
+  });
+
+  test('a missing source file exits 1 with the reason', async () => {
+    const dir = fixture({ premises: [premise({ source: 'gone.md', quote: 'x' })] });
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.match(report.missingQuotes[0].reason, /^source unreadable: ENOENT/);
+  });
+});
+
+describe('git sources', () => {
+  test('reads the file at a ref, not the working copy', async () => {
+    const dir = tempDir();
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+    git('init', '-q');
+    writeFileSync(join(dir, 'spec.md'), 'Tokens expire after 24 hours.\n');
+    git('add', 'spec.md');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'spec');
+    git('tag', 'v1');
+    writeFileSync(join(dir, 'spec.md'), 'Tokens expire after 1 hour.\n');
+    writeFileSync(join(dir, 'premises.json'), JSON.stringify({
+      premises: [
+        premise({ id: 'old', source: 'git:v1:spec.md', quote: 'expire after 24 hours' }),
+        premise({ id: 'new', source: 'git:v1:spec.md', quote: 'expire after 1 hour' }),
+        premise({ id: 'bad', source: 'git:nope:spec.md', quote: 'expire' }),
+      ],
+    }));
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.missingQuotes.map((m) => m.id), ['new', 'bad']);
+    assert.match(report.missingQuotes[1].reason, /^source unreadable: git show nope:spec.md failed/);
+  });
+
+  test('treats a ref that looks like an option as a ref, so it cannot write files', async () => {
+    const dir = tempDir();
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
+    git('init', '-q');
+    writeFileSync(join(dir, 'spec.md'), 'Tokens expire after 24 hours.\n');
+    git('add', 'spec.md');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'spec');
+    const target = join(tempDir(), 'written');
+    writeFileSync(join(dir, 'premises.json'), JSON.stringify({
+      premises: [premise({ source: `git:--output=${target}:HEAD`, quote: 'expire' })],
+    }));
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.equal(existsSync(`${target}:HEAD`), false, 'git show must not write the --output file');
+    assert.match(report.missingQuotes[0].reason, /^source unreadable: git show --output=/);
+  });
+});
+
+describe('test links', () => {
+  const files = {
+    'doc.md': 'Retries stop after 3 attempts.',
+    'tests/retry.test.js': "test('retry-stops-at-3', () => {});\n",
+  };
+  const quote = { source: 'doc.md', quote: 'Retries stop after 3 attempts.' };
+
+  test('a listed test found in testFiles links, and an unlisted premise is unpinned', async () => {
+    const dir = fixture({
+      testFiles: ['tests/**/*.test.js'],
+      premises: [premise({ id: 'a', ...quote, tests: ['retry-stops-at-3'] }), premise({ id: 'b', ...quote })],
+    }, files);
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.deepEqual(report.testFiles, ['tests/retry.test.js']);
+    assert.deepEqual(report.unpinned, ['b']);
+    assert.deepEqual(report.unknownTests, []);
+  });
+
+  test('a glob that also matches directories reads only the files', async () => {
+    const dir = fixture({ testFiles: ['tests/**'], premises: [premise({ ...quote, tests: ['retry-stops-at-3'] })] }, files);
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.deepEqual(report.testFiles, ['tests/retry.test.js']);
+  });
+
+  test('a listed test that does not exist exits 1', async () => {
+    const dir = fixture({ testFiles: ['tests/*.test.js'], premises: [premise({ ...quote, tests: ['retry-stops-at-5'] })] }, files);
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.unknownTests, [{ id: 'p1', test: 'retry-stops-at-5' }]);
+  });
+
+  test('an unsupported or contradicted premise pinned by a test exits 1', async () => {
+    const dir = fixture({
+      testFiles: ['tests/*.test.js'],
+      premises: [
+        premise({ id: 'u', verdict: 'unsupported', retrieved: undefined, tests: ['retry-stops-at-3'] }),
+        premise({ id: 'c', verdict: 'contradicted', ...quote, tests: ['retry-stops-at-3'] }),
+        premise({ id: 'u2', verdict: 'unsupported', retrieved: undefined }),
+      ],
+    }, files);
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.pinnedNotSupported.map((p) => [p.id, p.verdict]), [['u', 'unsupported'], ['c', 'contradicted']]);
+    assert.deepEqual(report.counts, { supported: 0, contradicted: 1, unsupported: 2 });
+    assert.deepEqual(report.unpinned, []);
+  });
+});
+
+describe('http sources', () => {
+  let server;
+  let base;
+  const pages = {
+    '/docs': ['text/html', '<html><body><h1>Limits</h1><p>Each key may send <em>60</em>\n requests a minute.</p></body></html>'],
+    '/app': ['text/html', '<html><body><div id="root"></div><script src="/app.js"></script></body></html>'],
+    '/plain': ['text/plain', 'Uploads are capped at 10 MB.'],
+  };
+
+  before(async () => {
+    server = createServer((req, res) => {
+      const page = pages[req.url];
+      res.writeHead(page ? 200 : 404, { 'content-type': page ? page[0] : 'text/plain' });
+      res.end(page ? page[1] : 'not found');
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    base = `http://127.0.0.1:${server.address().port}`;
+  });
+
+  after(() => server.close());
+
+  test('fetches, matches visible text, and stores the response with its command', async () => {
+    const dir = fixture({
+      premises: [
+        premise({ id: 'h', source: `${base}/docs`, quote: 'Each key may send 60 requests a minute.' }),
+        premise({ id: 't', source: `${base}/plain`, quote: 'capped at 10 MB' }),
+      ],
+    });
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.equal(report.captures.length, 2);
+    const cap = report.captures.find((c) => c.source === `${base}/docs`);
+    assert.equal(cap.command, `curl -sSL '${base}/docs'`);
+    assert.equal(cap.sha256, sha256(pages['/docs'][1]));
+    assert.equal(readFileSync(join(dir, cap.path), 'utf8'), pages['/docs'][1]);
+    const meta = JSON.parse(readFileSync(join(dir, cap.path.replace(/\.body$/, '.json')), 'utf8'));
+    assert.equal(meta.status, 200);
+    assert.equal(meta.command, cap.command);
+  });
+
+  test('a page rendered by JavaScript falls back to a snapshot whose digest matches, and says so', async () => {
+    const snapshot = '<p>Each key may send 60 requests a minute.</p>';
+    const dir = fixture({
+      premises: [premise({ source: `${base}/app`, quote: 'send 60 requests a minute', jsRendered: true, snapshot: { path: 'snap/app.html', sha256: sha256(snapshot) } })],
+    }, { 'snap/app.html': snapshot });
+    const { code, report } = await run(dir);
+    assert.equal(code, 0);
+    assert.equal(report.snapshotFallbacks.length, 1);
+    assert.equal(report.snapshotFallbacks[0].reason, 'quote not found in source');
+    assert.equal(report.snapshotFallbacks[0].sha256, sha256(snapshot));
+  });
+
+  test('a page that loads without the quote exits 1 when the premise is not jsRendered, despite a snapshot', async () => {
+    const snapshot = 'Each key may send 60 requests a minute.';
+    const dir = fixture({
+      premises: [premise({ source: `${base}/plain`, quote: 'send 60 requests a minute', snapshot: { path: 'snap.txt', sha256: sha256(snapshot) } })],
+    }, { 'snap.txt': snapshot });
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.equal(report.missingQuotes[0].reason, 'quote not found in source');
+    assert.deepEqual(report.snapshotFallbacks, []);
+  });
+
+  test('a snapshot whose digest no longer matches exits 1', async () => {
+    const dir = fixture({
+      premises: [premise({ source: `${base}/app`, quote: 'send 60 requests a minute', jsRendered: true, snapshot: { path: 'snap.html', sha256: sha256('original') } })],
+    }, { 'snap.html': '<p>Each key may send 60 requests a minute.</p>' });
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.match(report.missingQuotes[0].reason, /digest .* does not match the recorded/);
+    assert.deepEqual(report.snapshotFallbacks, []);
+  });
+
+  test('an HTTP error exits 1, or falls back to a snapshot', async () => {
+    const snapshot = 'Each key may send 60 requests a minute.';
+    const dir = fixture({
+      premises: [
+        premise({ id: 'no-snap', source: `${base}/gone`, quote: 'send 60 requests' }),
+        premise({ id: 'snap', source: `${base}/gone`, quote: 'send 60 requests', snapshot: { path: 'snap.txt', sha256: sha256(snapshot) } }),
+      ],
+    }, { 'snap.txt': snapshot });
+    const { code, report } = await run(dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.missingQuotes.map((m) => m.id), ['no-snap']);
+    assert.match(report.missingQuotes[0].reason, /HTTP 404/);
+    assert.deepEqual(report.snapshotFallbacks.map((s) => s.id), ['snap']);
+    assert.match(report.snapshotFallbacks[0].reason, /source unreadable: HTTP 404/);
+    assert.equal(report.captures.length, 0, 'an error response is not stored as evidence');
+  });
+
+  // Git can carry a symlink in a cloned repository, and the capture name is predictable.
+  // Each premise has a valid snapshot, so a fallback must not hide the refusal.
+  for (const [label, link, target] of [
+    ['.premises', () => '.premises', 'elsewhere'],
+    ['captures', () => '.premises/captures', 'elsewhere'],
+    ['a capture body', (name) => `.premises/captures/${name}.body`, 'elsewhere/stolen'],
+    ['a capture record', (name) => `.premises/captures/${name}.json`, 'elsewhere/stolen'],
+  ]) {
+    test(`a symlink at ${label} exits 2 and writes nothing through it`, async () => {
+      const snapshot = 'Uploads are capped at 10 MB.';
+      const url = `${base}/plain`;
+      const dir = fixture({
+        premises: [premise({ source: url, quote: 'capped at 10 MB', snapshot: { path: 'snap.txt', sha256: sha256(snapshot) } })],
+      }, { 'snap.txt': snapshot, 'elsewhere/.keep': '' });
+      const path = join(dir, link(sha256(url).slice(0, 16)));
+      mkdirSync(dirname(path), { recursive: true });
+      symlinkSync(join(dir, target), path);
+      const { code, report } = await run(dir);
+      assert.equal(code, 2);
+      assert.match(report.error, /symbolic link/);
+      assert.deepEqual(readdirSync(join(dir, 'elsewhere')), ['.keep']);
+    });
+  }
+});
+
+describe('usage and input errors exit 2', () => {
+  test('unknown command', () => {
+    assert.equal(cli('verify').code, 2);
+  });
+
+  test('missing ledger', () => {
+    const r = cli('check', join(tempDir(), 'premises.json'));
+    assert.equal(r.code, 2);
+    assert.match(r.report.error, /cannot read/);
+  });
+
+  test('an option or a second path', () => {
+    assert.equal(cli('check', EXAMPLE, '--captures', 'out').code, 2);
+    assert.equal(cli('check', EXAMPLE, EXAMPLE).code, 2);
+  });
+
+  test('invalid JSON', () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, 'premises.json'), '{ nope');
+    assert.equal(cli('check', dir).code, 2);
+  });
+
+  for (const [name, bad, message] of [
+    ['bad verdict', premise({ source: 'a', quote: 'b', verdict: 'likely' }), /verdict must be one of/],
+    ['missing quote', premise({ source: 'a' }), /quote must be a non-empty string/],
+    ['bad date', premise({ source: 'a', quote: 'b', retrieved: '25 Oct' }), /retrieved must be a YYYY-MM-DD date/],
+    ['unknown field', premise({ source: 'a', quote: 'b', url: 'x' }), /unknown field "url"/],
+    ['snapshot on a file source', premise({ source: 'a', quote: 'b', snapshot: { path: 's', sha256: sha256('') } }), /only allowed for http/],
+    ['jsRendered without a snapshot', premise({ source: 'http://x', quote: 'b', jsRendered: true }), /jsRendered requires a snapshot/],
+    ['jsRendered not a boolean', premise({ source: 'http://x', quote: 'b', jsRendered: 'yes', snapshot: { path: 's', sha256: sha256('') } }), /jsRendered must be a boolean/],
+  ]) {
+    test(name, () => {
+      const r = cli('check', fixture({ premises: [bad] }));
+      assert.equal(r.code, 2);
+      assert.match(r.report.error, message);
+    });
+  }
+
+  test('duplicate IDs', () => {
+    const p = premise({ source: 'a', quote: 'b' });
+    const r = cli('check', fixture({ premises: [p, p] }));
+    assert.equal(r.code, 2);
+    assert.match(r.report.error, /duplicate/);
+  });
+});
+
+describe('schema and validator agree', () => {
+  const schema = JSON.parse(readFileSync(join(ROOT, 'schema', 'premises.schema.json'), 'utf8'));
+  const samples = {
+    id: 'p1',
+    claim: 'A claim.',
+    source: 'https://example.com/docs',
+    quote: 'a quote',
+    retrieved: '2026-10-25',
+    verdict: 'supported',
+    tests: ['t1'],
+    paraphrasedIn: [{ source: 'contract.md', quote: 'a paraphrase' }],
+    snapshot: { path: 'snap.txt', sha256: sha256('') },
+    jsRendered: true,
+    note: 'A note.',
+  };
+
+  test('the validator accepts every premise field the schema lists', () => {
+    const fields = Object.keys(schema.$defs.premise.properties);
+    assert.deepEqual(fields.filter((f) => !(f in samples)), [], 'add a sample for each new schema field');
+    for (const field of fields) {
+      const p = premise({ source: 'https://example.com/docs', quote: 'a quote', snapshot: samples.snapshot, [field]: samples[field] });
+      assert.doesNotThrow(() => validate({ premises: [p] }), field);
+    }
+  });
+
+  test('the validator rejects a premise field the schema does not list', () => {
+    assert.throws(() => validate({ premises: [premise({ source: 'a', quote: 'b', extra: 1 })] }), /unknown field "extra"/);
+  });
+
+  test('both reject whitespace-only claims, quotes, and test IDs', () => {
+    const props = schema.$defs.premise.properties;
+    for (const [name, rule, fields] of [
+      ['claim', props.claim, { source: 'a', quote: 'b', claim: ' \n ' }],
+      ['quote', props.quote, { source: 'a', quote: ' \t ' }],
+      ['tests', props.tests.items, { source: 'a', quote: 'b', tests: ['  '] }],
+      ['paraphrasedIn quote', props.paraphrasedIn.items.properties.quote, { source: 'a', quote: 'b', paraphrasedIn: [{ source: 'c', quote: '  ' }] }],
+    ]) {
+      assert.equal(new RegExp(rule.pattern, 'u').test(' \n\t '), false, `schema accepts a blank ${name}`);
+      assert.throws(() => validate({ premises: [premise(fields)] }), /non-empty/, name);
+    }
+  });
+
+  test('both allow a snapshot only on an http(s) source', () => {
+    const rule = schema.$defs.premise.allOf.find((r) => r.if?.required?.includes('snapshot'));
+    assert.deepEqual(rule.then.required, ['source']);
+    const pattern = new RegExp(rule.then.properties.source.pattern, 'u');
+    for (const source of ['https://example.com/docs', 'http://example.com/docs']) {
+      assert.equal(pattern.test(source), true, source);
+      assert.doesNotThrow(() => validate({ premises: [premise({ source, quote: 'b', snapshot: samples.snapshot })] }), source);
+    }
+    for (const source of ['docs.md', 'git:main:docs.md']) {
+      assert.equal(pattern.test(source), false, source);
+      assert.throws(() => validate({ premises: [premise({ source, quote: 'b', snapshot: samples.snapshot })] }), /only allowed for http/, source);
+    }
+  });
+});

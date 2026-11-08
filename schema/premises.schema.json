@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/bennyjo/verifiable-premises/main/schema/premises.schema.json",
+  "title": "premises.json",
+  "description": "A ledger of the premises a task relies on, each tied to a quoted primary source and to the tests that pin it.",
+  "type": "object",
+  "required": ["premises"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "task": { "type": "string", "description": "What the task is, in one line." },
+    "testFiles": {
+      "description": "Globs, relative to this file, of the test files that test IDs are searched in.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "premises": { "type": "array", "items": { "$ref": "#/$defs/premise" } }
+  },
+  "$defs": {
+    "source": {
+      "description": "An http(s) URL, a local path relative to this file, or git:<ref>:<path> with the path relative to the repository root.",
+      "type": "string",
+      "minLength": 1
+    },
+    "premise": {
+      "type": "object",
+      "required": ["id", "claim", "verdict", "tests"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "claim": { "type": "string", "pattern": "\\S", "description": "The fact the task relies on, in your own words." },
+        "source": { "$ref": "#/$defs/source", "description": "The primary source: the system itself, its docs, or the decision record." },
+        "quote": { "type": "string", "pattern": "\\S", "description": "A verbatim passage from the source. Only whitespace is normalized." },
+        "retrieved": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "description": "The date the quote was read from the source." },
+        "verdict": {
+          "enum": ["supported", "contradicted", "unsupported"],
+          "description": "What the source says about the claim. Only supported premises may be pinned by tests."
+        },
+        "tests": {
+          "description": "IDs of the tests that pin this premise. Each ID must appear verbatim in a file matched by testFiles.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "\\S" }
+        },
+        "paraphrasedIn": {
+          "description": "Secondary documents that restate the claim, such as a contract or brief. Their quotes are checked, but they never support the claim.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["source", "quote"],
+            "properties": {
+              "source": { "$ref": "#/$defs/source" },
+              "quote": { "type": "string", "pattern": "\\S" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "snapshot": {
+          "description": "A stored copy of an http(s) source, used when a live fetch fails, or when jsRendered is true and the live page does not show the quote.",
+          "type": "object",
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "additionalProperties": false
+        },
+        "jsRendered": {
+          "type": "boolean",
+          "description": "True when the source page is rendered by JavaScript, so a successful fetch that lacks the quote falls back to the snapshot. Without it, such a fetch is a missing quote."
+        },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": false,
+      "dependentRequired": { "jsRendered": ["snapshot"] },
+      "allOf": [
+        {
+          "if": { "properties": { "verdict": { "enum": ["supported", "contradicted"] } } },
+          "then": { "required": ["source", "quote", "retrieved"] },
+          "else": {
+            "dependentRequired": { "source": ["quote", "retrieved"], "quote": ["source", "retrieved"] }
+          }
+        },
+        {
+          "if": { "required": ["snapshot"] },
+          "then": { "required": ["source"], "properties": { "source": { "pattern": "^https?:" } } }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false
+}
