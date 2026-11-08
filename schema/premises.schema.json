@@ -13,6 +13,12 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "testCommand": {
+      "description": "The command that premises mutate runs, as an argv array without a shell, in a copy of this file's directory. Each {pattern} is replaced with a regular expression that matches the premise's test IDs. Without {pattern}, every mutant runs the whole command.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
     "premises": { "type": "array", "items": { "$ref": "#/$defs/premise" } }
   },
   "$defs": {
@@ -38,6 +44,27 @@
           "description": "IDs of the tests that pin this premise. Each ID must appear verbatim in a file matched by testFiles.",
           "type": "array",
           "items": { "type": "string", "pattern": "\\S" }
+        },
+        "mutants": {
+          "description": "Where the code under test encodes this premise. premises mutate changes each number, comparison, equality, boolean, and string literal in each find text, one at a time, and expects the linked tests to fail.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["file", "find"],
+            "properties": {
+              "file": {
+                "type": "string",
+                "pattern": "^(?![/\\\\]|[A-Za-z]:)(?!(?:.*[/\\\\])?\\.\\.(?:[/\\\\]|$)).+$",
+                "description": "A path relative to this file, inside its directory."
+              },
+              "find": {
+                "type": "string",
+                "pattern": "\\S",
+                "description": "Exact text that occurs once in the file."
+              }
+            },
+            "additionalProperties": false
+          }
         },
         "paraphrasedIn": {
           "description": "Secondary documents that restate the claim, such as a contract or brief. Their quotes are checked, but they never support the claim.",
@@ -77,6 +104,10 @@
           "else": {
             "dependentRequired": { "source": ["quote", "retrieved"], "quote": ["source", "retrieved"] }
           }
+        },
+        {
+          "if": { "properties": { "verdict": { "not": { "const": "supported" } } } },
+          "then": { "properties": { "mutants": false } }
         },
         {
           "if": { "required": ["snapshot"] },

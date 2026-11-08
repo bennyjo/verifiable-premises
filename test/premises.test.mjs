@@ -2,14 +2,14 @@
 // by a local server on 127.0.0.1.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { htmlToText, main, normalize, sha256, validate } from '../bin/premises.mjs';
+import { htmlToText, main, mutationsOf, normalize, sha256, validate } from '../bin/premises.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(ROOT, 'bin', 'premises.mjs');
@@ -391,11 +391,24 @@ describe('usage and input errors exit 2', () => {
     ['snapshot on a file source', premise({ source: 'a', quote: 'b', snapshot: { path: 's', sha256: sha256('') } }), /only allowed for http/],
     ['jsRendered without a snapshot', premise({ source: 'http://x', quote: 'b', jsRendered: true }), /jsRendered requires a snapshot/],
     ['jsRendered not a boolean', premise({ source: 'http://x', quote: 'b', jsRendered: 'yes', snapshot: { path: 's', sha256: sha256('') } }), /jsRendered must be a boolean/],
+    ['mutants on a contradicted premise', premise({ source: 'a', quote: 'b', verdict: 'contradicted', mutants: [{ file: 'a.js', find: '3' }] }), /mutants is only allowed on a supported premise/],
+    ['mutants file outside the ledger directory', premise({ source: 'a', quote: 'b', mutants: [{ file: 'src/../../a.js', find: '3' }] }), /file must be a relative path inside/],
+    ['mutants file with an absolute path', premise({ source: 'a', quote: 'b', mutants: [{ file: '/etc/a.js', find: '3' }] }), /file must be a relative path inside/],
+    ['mutants without find', premise({ source: 'a', quote: 'b', mutants: [{ file: 'a.js' }] }), /find must be a non-empty string/],
+    ['mutants with an unknown field', premise({ source: 'a', quote: 'b', mutants: [{ file: 'a.js', find: '3', line: 4 }] }), /unknown field "line"/],
   ]) {
     test(name, () => {
       const r = cli('check', fixture({ premises: [bad] }));
       assert.equal(r.code, 2);
       assert.match(r.report.error, message);
+    });
+  }
+
+  for (const [name, testCommand] of [['empty', []], ['an empty argument', ['node', '']], ['a string', 'npm test']]) {
+    test(`testCommand that is ${name}`, () => {
+      const r = cli('check', fixture({ testCommand, premises: [] }));
+      assert.equal(r.code, 2);
+      assert.match(r.report.error, /"testCommand" must be a non-empty array of non-empty strings/);
     });
   }
 
@@ -421,6 +434,7 @@ describe('schema and validator agree', () => {
     snapshot: { path: 'snap.txt', sha256: sha256('') },
     jsRendered: true,
     note: 'A note.',
+    mutants: [{ file: 'src/retry.mjs', find: 'MAX_RETRIES = 3' }],
   };
 
   test('the validator accepts every premise field the schema lists', () => {
@@ -443,9 +457,36 @@ describe('schema and validator agree', () => {
       ['quote', props.quote, { source: 'a', quote: ' \t ' }],
       ['tests', props.tests.items, { source: 'a', quote: 'b', tests: ['  '] }],
       ['paraphrasedIn quote', props.paraphrasedIn.items.properties.quote, { source: 'a', quote: 'b', paraphrasedIn: [{ source: 'c', quote: '  ' }] }],
+      ['mutants find', props.mutants.items.properties.find, { source: 'a', quote: 'b', mutants: [{ file: 'a.js', find: ' \t ' }] }],
     ]) {
       assert.equal(new RegExp(rule.pattern, 'u').test(' \n\t '), false, `schema accepts a blank ${name}`);
       assert.throws(() => validate({ premises: [premise(fields)] }), /non-empty/, name);
+    }
+  });
+
+  test('both accept testCommand at the ledger level', () => {
+    assert.deepEqual(schema.properties.testCommand.items, { type: 'string', minLength: 1 });
+    assert.doesNotThrow(() => validate({ testCommand: ['node', '--test'], premises: [] }));
+  });
+
+  test('both allow mutants only on a supported premise', () => {
+    const rule = schema.$defs.premise.allOf.find((r) => r.then?.properties?.mutants === false);
+    assert.deepEqual(rule.if.properties.verdict, { not: { const: 'supported' } });
+    for (const verdict of ['contradicted', 'unsupported']) {
+      assert.throws(() => validate({ premises: [premise({ source: 'a', quote: 'b', verdict, mutants: [] })] }), /only allowed on a supported/);
+    }
+  });
+
+  test('both accept a mutants file only inside the ledger directory', () => {
+    const pattern = new RegExp(schema.$defs.premise.properties.mutants.items.properties.file.pattern, 'u');
+    const check = (file) => () => validate({ premises: [premise({ source: 'a', quote: 'b', mutants: [{ file, find: '3' }] })] });
+    for (const file of ['retry.mjs', 'src/retry.mjs', 'src/a..b.mjs', './src/retry.mjs']) {
+      assert.equal(pattern.test(file), true, file);
+      assert.doesNotThrow(check(file), file);
+    }
+    for (const file of ['', '..', '../retry.mjs', 'src/../../retry.mjs', 'src\\..\\..\\retry.mjs', '/src/retry.mjs', 'C:\\retry.mjs']) {
+      assert.equal(pattern.test(file), false, file);
+      assert.throws(check(file), /inside the ledger's directory/, file);
     }
   });
 
@@ -461,5 +502,247 @@ describe('schema and validator agree', () => {
       assert.equal(pattern.test(source), false, source);
       assert.throws(() => validate({ premises: [premise({ source, quote: 'b', snapshot: samples.snapshot })] }), /only allowed for http/, source);
     }
+  });
+});
+
+describe('mutate', () => {
+  // These tests run under node --test, which tells its child processes to report to it.
+  // The test commands below start their own runner, so they must not inherit that.
+  before(() => delete process.env.NODE_TEST_CONTEXT);
+
+  const RETRY = [
+    'export const MAX_RETRIES = 3;',
+    'export const SCHEDULE = { payment: [60_000, 600_000] };',
+    '',
+    'export function shouldRetry(attempt) {',
+    '  return attempt <= MAX_RETRIES;',
+    '}',
+    '',
+  ].join('\n');
+  const CAP = 'retry-cap: allows the third retry and refuses the fourth';
+  const PAYMENT = 'payment-schedule: waits one minute, then ten';
+  const header = "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport { SCHEDULE, shouldRetry } from '../src/retry.mjs';\n";
+  const capTest = `test('${CAP}', () => {\n  assert.equal(shouldRetry(3), true);\n  assert.equal(shouldRetry(4), false);\n});\n`;
+  const strongPayment = `test('${PAYMENT}', () => {\n  assert.deepEqual(SCHEDULE.payment, [60_000, 600_000]);\n});\n`;
+  const weakPayment = `test('${PAYMENT}', () => {\n  assert.equal(SCHEDULE.payment.length, 2);\n});\n`;
+  const PATTERN_COMMAND = [process.execPath, '--test', '--test-name-pattern', '{pattern}', 'test/*.test.mjs'];
+  const SUITE_COMMAND = [process.execPath, '--test', 'test/*.test.mjs'];
+  const source = { source: 'design.md', quote: 'At most three retries.' };
+
+  function project({ tests = header + capTest + strongPayment, testCommand = PATTERN_COMMAND, premises, files = {} }) {
+    return fixture({ testFiles: ['test/*.test.mjs'], testCommand, premises }, {
+      'design.md': 'At most three retries.\n',
+      'src/retry.mjs': RETRY,
+      'test/retry.test.mjs': tests,
+      ...files,
+    });
+  }
+
+  const capPremise = (fields = {}) => premise({
+    id: 'retry-cap',
+    ...source,
+    tests: [CAP],
+    mutants: [{ file: 'src/retry.mjs', find: 'MAX_RETRIES = 3' }, { file: 'src/retry.mjs', find: 'attempt <= MAX_RETRIES' }],
+    ...fields,
+  });
+  const paymentPremise = (fields = {}) => premise({
+    id: 'payment-schedule',
+    ...source,
+    tests: [PAYMENT],
+    mutants: [{ file: 'src/retry.mjs', find: '[60_000, 600_000]' }],
+    ...fields,
+  });
+
+  async function mutate(dir, options = {}) {
+    let out = '';
+    let err = '';
+    const io = { out: { write: (s) => (out += s) }, err: { write: (s) => (err += s) } };
+    const code = await main(['mutate', dir], io, options);
+    return { code, report: JSON.parse(out), progress: err.split('\n').filter(Boolean) };
+  }
+
+  // Every file under dir with its bytes and modification time.
+  function tree(dir) {
+    return readdirSync(dir, { recursive: true }).sort().map((f) => {
+      const path = join(dir, f);
+      const stat = statSync(path);
+      return [f, stat.mtimeMs, stat.isFile() ? readFileSync(path, 'utf8') : null];
+    });
+  }
+
+  test('lists the value mutations of numbers, comparisons, equality, booleans, and strings', () => {
+    const row = (m) => `${m.from} -> ${m.to} (${m.kind})`;
+    assert.deepEqual(mutationsOf('failures >= 20 && hours > 6.5').map(row), [
+      '>= -> > (comparison)', '20 -> 21 (number)', '20 -> 19 (number)', '> -> >= (comparison)', '6.5 -> 7.5 (number)', '6.5 -> 5.5 (number)',
+    ]);
+    assert.deepEqual(mutationsOf("kind === 'payment' && x != 0 && on == True").map(row), [
+      '=== -> !== (equality)', "'payment' -> 'payment-mutant' (string)", '!= -> == (equality)', '0 -> 1 (number)', '== -> != (equality)', 'True -> False (boolean)',
+    ]);
+    assert.deepEqual(mutationsOf('delay = 60_000; retry = false; a < b').map(row), [
+      '60_000 -> 60001 (number)', '60_000 -> 59999 (number)', 'false -> true (boolean)', '< -> <= (comparison)',
+    ]);
+    assert.equal(mutationsOf('const f = (a) => a << 2 >> 1, v2, 0x1F, 1e3, 9n, x <- ch')
+      .map(row).join(', '), '2 -> 3 (number), 2 -> 1 (number), 1 -> 2 (number), 1 -> 0 (number)',
+    'arrows, shifts, identifiers, and hex, exponent, and BigInt literals are left alone');
+    assert.deepEqual(mutationsOf(`"it's 3" + 'say "4"'`).map((m) => m.to), [`"it's 3-mutant"`, `'say "4"-mutant'`]);
+    assert.deepEqual(mutationsOf('x - 0.25').map((m) => m.to), ['1.25', '-0.75']);
+  });
+
+  test('strong linked tests kill every mutant, and the source tree is unchanged', async () => {
+    const dir = project({ premises: [capPremise(), paymentPremise()] });
+    const before = tree(dir);
+    const { code, report, progress } = await mutate(dir);
+    assert.equal(code, 0, JSON.stringify(report, null, 2));
+    assert.equal(report.ok, true);
+    assert.equal(report.selection, 'pattern');
+    assert.deepEqual(report.counts, { killed: 7, survived: 0, timedOut: 0 });
+    assert.deepEqual(report.survived, []);
+    const cap = report.premises.find((p) => p.id === 'retry-cap');
+    assert.deepEqual(cap.baseline.testsNotSeen, []);
+    assert.equal(cap.baseline.exitCode, 0);
+    assert.deepEqual(cap.mutants.map((m) => [m.line, m.kind, m.from, m.to, m.result]), [
+      [1, 'number', '3', '4', 'killed'],
+      [1, 'number', '3', '2', 'killed'],
+      [5, 'comparison', '<=', '<', 'killed'],
+    ]);
+    assert.equal(progress.length, 7);
+    assert.match(progress[0], /^retry-cap {2}src\/retry\.mjs:1 {2}3 -> 4 {2}killed {2}\d+ms$/);
+    assert.deepEqual(tree(dir), before, 'mutate never writes to the ledger directory');
+  });
+
+  test('weak linked tests leave survivors and exit 1', async () => {
+    const dir = project({ tests: header + capTest + weakPayment, premises: [capPremise(), paymentPremise()] });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 1);
+    assert.equal(report.ok, false);
+    assert.deepEqual(report.counts, { killed: 3, survived: 4, timedOut: 0 });
+    assert.deepEqual(report.survived[0], {
+      id: 'payment-schedule', file: 'src/retry.mjs', line: 2, kind: 'number', from: '60_000', to: '60001', mutated: '[60001, 600_000]',
+    });
+    assert.deepEqual(report.survived.map((s) => s.to), ['60001', '59999', '600001', '599999']);
+  });
+
+  test('runs only the linked tests, so a mutant that only an unlinked test catches survives', async () => {
+    const wrongLink = paymentPremise({ mutants: [{ file: 'src/retry.mjs', find: 'MAX_RETRIES = 3' }] });
+    const scoped = await mutate(project({ premises: [wrongLink] }));
+    assert.equal(scoped.code, 1);
+    assert.deepEqual(scoped.report.counts, { killed: 0, survived: 2, timedOut: 0 });
+
+    const suite = await mutate(project({ testCommand: SUITE_COMMAND, premises: [wrongLink] }));
+    assert.equal(suite.code, 0);
+    assert.equal(suite.report.selection, 'suite');
+    assert.deepEqual(suite.report.counts, { killed: 2, survived: 0, timedOut: 0 });
+  });
+
+  test('warns about linked tests the baseline run never names', async () => {
+    const dir = project({
+      tests: `${header}// payment-schedule-exact is only mentioned here.\n${capTest}`,
+      premises: [paymentPremise({ tests: ['payment-schedule-exact'] })],
+    });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 1, 'no test ran, so every mutant survives');
+    assert.deepEqual(report.premises[0].baseline.testsNotSeen, ['payment-schedule-exact']);
+    assert.equal(report.counts.survived, 4);
+  });
+
+  test('a stale, ambiguous, or valueless target is invalid and exits 1', async () => {
+    const dir = project({
+      premises: [capPremise({
+        mutants: [
+          { file: 'src/retry.mjs', find: 'MAX_RETRIES = 4' },
+          { file: 'src/retry.mjs', find: 'MAX_RETRIES' },
+          { file: 'src/retry.mjs', find: 'export function shouldRetry' },
+          { file: 'src/gone.mjs', find: '3' },
+          { file: 'src', find: '3' },
+          { file: 'src/retry.mjs', find: 'MAX_RETRIES = 3' },
+        ],
+      })],
+    });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 1);
+    assert.deepEqual(report.invalidMutants.map((m) => [m.file, m.reason]), [
+      ['src/retry.mjs', 'find text not found'],
+      ['src/retry.mjs', 'find text found more than once'],
+      ['src/retry.mjs', 'no value to mutate'],
+      ['src/gone.mjs', 'file not found'],
+      ['src', 'not a file'],
+    ]);
+    assert.deepEqual(report.counts, { killed: 2, survived: 0, timedOut: 0 }, 'the valid target still runs');
+  });
+
+  test('linked tests that fail before any mutation exit 2 and run no mutant', async () => {
+    const broken = `test('${PAYMENT}', () => {\n  assert.deepEqual(SCHEDULE.payment, [1, 2]);\n});\n`;
+    const dir = project({ tests: header + capTest + broken, premises: [paymentPremise(), capPremise()] });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 2);
+    assert.equal(report.ok, false);
+    assert.match(report.error, /fail before any mutation for payment-schedule$/);
+    const payment = report.premises.find((p) => p.id === 'payment-schedule');
+    assert.notEqual(payment.baseline.exitCode, 0);
+    assert.match(payment.baseline.output, /payment-schedule/);
+    assert.deepEqual(payment.mutants, []);
+    assert.deepEqual(report.counts, { killed: 3, survived: 0, timedOut: 0 }, 'other premises still run');
+  });
+
+  test('a test command that cannot start is a failing baseline', async () => {
+    const dir = project({ testCommand: [join(tempDir(), 'no-such-runner')], premises: [capPremise()] });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 2);
+    assert.match(report.premises[0].baseline.output, /ENOENT/);
+  });
+
+  test('a mutant that hangs the tests times out, counts as caught, and is listed separately', async () => {
+    const count = 'export function count(n) {\n  let i = 0;\n  while (i < n) i += 1;\n  return i;\n}\n';
+    const tests = "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport { count } from '../src/count.mjs';\ntest('count: counts to three', () => assert.equal(count(3), 3));\n";
+    const dir = project({
+      tests,
+      files: { 'src/count.mjs': count },
+      premises: [premise({ id: 'count', ...source, tests: ['count: counts to three'], mutants: [{ file: 'src/count.mjs', find: 'i += 1' }] })],
+    });
+    const { code, report } = await mutate(dir, { minTimeoutMs: 1500 });
+    assert.equal(code, 0);
+    assert.deepEqual(report.counts, { killed: 1, survived: 0, timedOut: 1 });
+    assert.deepEqual(report.premises[0].mutants.map((m) => [m.to, m.result]), [['2', 'killed'], ['0', 'timedOut']]);
+  });
+
+  test('lists pinned premises without mutants, and skips mutants on premises no test pins yet', async () => {
+    const dir = project({
+      premises: [
+        capPremise({ mutants: undefined }),
+        paymentPremise({ tests: [] }),
+        premise({ id: 'c', ...source, verdict: 'contradicted' }),
+      ],
+    });
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 0);
+    assert.deepEqual(report.noMutants, ['retry-cap']);
+    assert.deepEqual(report.unpinned, ['payment-schedule']);
+    assert.deepEqual(report.premises, []);
+  });
+
+  test('a ledger without testCommand exits 2', async () => {
+    const dir = fixture({ premises: [capPremise()] });
+    const r = cli('mutate', dir);
+    assert.equal(r.code, 2);
+    assert.match(r.report.error, /no "testCommand"/);
+  });
+
+  test('refuses to write through a symbolic link to a file outside the copy', async () => {
+    const outside = join(tempDir(), 'retry.mjs');
+    writeFileSync(outside, RETRY);
+    const dir = project({ premises: [capPremise({ mutants: [{ file: 'src/linked.mjs', find: 'MAX_RETRIES = 3' }] })] });
+    symlinkSync(outside, join(dir, 'src', 'linked.mjs'));
+    const { code, report } = await mutate(dir);
+    assert.equal(code, 2);
+    assert.match(report.error, /refusing to mutate src\/linked\.mjs through a symbolic link/);
+    assert.equal(readFileSync(outside, 'utf8'), RETRY);
+  });
+
+  test('runs from the command line and writes progress to stderr', () => {
+    const dir = project({ premises: [capPremise()] });
+    const r = cli('mutate', dir);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(r.report.counts, { killed: 3, survived: 0, timedOut: 0 });
+    assert.equal(r.stderr.trim().split('\n').length, 3);
   });
 });
