@@ -7,10 +7,44 @@ Check every premise a task relies on against a quoted primary source, and link e
 One wrong premise about an outside system can be copied into the code, the tests, and the reviewer's brief, so every gate agrees with it.
 A `premises.json` ledger records each premise with a verbatim quote from its primary source, and a script re-checks that the quote is still there and that every test link is valid.
 
+## The problem
+
+Tests and reviews check code against what the author believes about the outside world.
+When that belief is wrong, every gate inherits the error:
+
+1. A brief or contract restates a vendor limit, a spec rule, or a design decision, and gets it slightly wrong.
+2. The code implements the wrong rule.
+3. The tests assert the same wrong rule, so they pass.
+4. The reviewer reads the same brief, so the change looks correct.
+
+Nothing in that chain ever goes back to the primary source, so green tests and an approved review say nothing about whether the premise is true.
+The same gap opens later when the source changes: the docs move on, but the tests keep pinning the old behavior.
+
+Verifiable Premises closes the gap with a ledger that ties each premise to a verbatim quote from its primary source, and a checker that confirms each quote is still there and that each test pins only a premise the source supports.
+
 ## Who it's for
 
 Developers and coding agents who write tests or code that depend on facts they didn't establish themselves: how an outside API behaves, a limit from vendor docs, a rule from a spec, or a decision recorded in a design report.
 It's most useful when a contract, brief, or issue restates those facts second-hand.
+
+## Where it fits in the development lifecycle
+
+The ledger is written first and checked again at every later stage, by the same command.
+
+```mermaid
+flowchart LR
+  A[Research and spec] --> B[Plan] --> C[Build and test] --> D[Review] --> E[CI] --> F[Maintenance]
+  L[(premises.json)] -.-> A & B & C & D & E & F
+```
+
+| Stage | What Verifiable Premises does |
+|---|---|
+| Research and spec | You write `premises.json` before any code: one claim per fact, its primary source, and a verbatim quote. The checker confirms each quote is in its source, whether that's a local file, a file at a Git ref, or an `http(s)` page. A brief or contract that restates a claim goes in `paraphrasedIn`, and its quote is checked too, so you can see which documents repeat a fact second-hand. |
+| Plan | Each premise gets a verdict: `supported`, `contradicted`, or `unsupported`. A `contradicted` premise quotes the passage that disproves it, so you fix the plan or brief before building on it. An `unsupported` premise is an open question, not a fact to build on. |
+| Build and test | Each test that depends on a premise puts that premise's test ID in its name, and the ledger lists the same ID. The checker fails when a listed test ID appears in no file that the ledger's `testFiles` globs match, or when a test pins a premise that is `contradicted` or `unsupported`. It lists supported premises that no test pins yet under `unpinned`. |
+| Review | You attach the checker's JSON report to the PR or the reviewer's brief. The reviewer sees each claim with its source and quote, the counts per verdict, and which premises are still unpinned, instead of trusting the brief's restatement. For `http(s)` sources, the report lists the stored captures and any fallback to a saved snapshot, so the reviewer knows whether the evidence came from the live page. |
+| CI | Run `premises check` as a step. It exits 1 when a quote is missing or changed or a test link is invalid, and 2 when the ledger is malformed, so the build fails without parsing the report. This repository doesn't ship a ready-made CI action. |
+| Maintenance | Rerunning the check shows when a source no longer says what the ledger quotes: an edited local file, a moved branch for a `git:` source, or a changed web page. The report lists the tests that pin each premise, so you know which tests to revisit. A premise whose page is rendered by JavaScript can fall back to a saved snapshot, but only when its digest still matches, and the report lists every fallback. |
 
 ## Status
 
